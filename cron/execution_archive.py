@@ -428,12 +428,16 @@ def lookup(path: Path, *, table: str, record_id: str) -> list[dict]:
     conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
+        conn.execute("BEGIN")
         verify_schema(conn)
+        _verify_current_rows(conn)
         stream = conn.execute("SELECT stream_id FROM execution_archive_meta WHERE id=1").fetchone()[0]
-        rows = conn.execute("SELECT e.*, r.digest FROM execution_archive_events e JOIN "
+        rows = conn.execute("SELECT e.*, r.digest FROM execution_archive_events e LEFT JOIN "
                             "execution_archive_receipts r ON r.event_id=e.event_id "
                             "WHERE e.table_name=? AND e.record_id=? ORDER BY e.event_id",
                             (table, record_id)).fetchall()
+        if any(event["digest"] is None for event in rows):
+            raise ArchiveUnavailable("Cron historical lineage is missing a durable receipt")
         result = []
         with _directory(path) as directory:
             for event in rows:

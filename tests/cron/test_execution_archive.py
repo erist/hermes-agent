@@ -406,3 +406,29 @@ def test_schema_manifest_rejects_update_delete_and_replace(ledger):
                 conn.execute(statement)
             conn.rollback()
         assert conn.execute("SELECT * FROM execution_archive_schemas ORDER BY table_name").fetchall() == originals
+
+
+@pytest.mark.parametrize("fault", ["unlogged-current-row", "unreceipted-latest-event"])
+def test_historical_lookup_rejects_incomplete_lineage(ledger, fault):
+    _, path = ledger
+    row, _ = _claim()
+    initial = archive.lookup(path, table="executions", record_id=row["id"])
+    assert initial[-1]["original"]["row"]["status"] == "claimed"
+    with closing(sqlite3.connect(path)) as conn:
+        name = "execution_archive_capture_executions_UPDATE"
+        definition = conn.execute("SELECT sql FROM sqlite_master WHERE name=?", (name,)).fetchone()[0]
+        if fault == "unlogged-current-row":
+            conn.execute(f"DROP TRIGGER {name}")
+        conn.execute("UPDATE executions SET status='running' WHERE id=?", (row["id"],))
+        if fault == "unlogged-current-row":
+            conn.execute(definition)
+        conn.commit()
+    originals = _rows(path)
+    events = _rows(path, "execution_archive_events")
+    receipts = _rows(path, "execution_archive_receipts")
+    expected = "exact current row" if fault == "unlogged-current-row" else "missing a durable receipt"
+    with pytest.raises(archive.ArchiveUnavailable, match=expected):
+        archive.lookup(path, table="executions", record_id=row["id"])
+    assert _rows(path) == originals
+    assert _rows(path, "execution_archive_events") == events
+    assert _rows(path, "execution_archive_receipts") == receipts
