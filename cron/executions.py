@@ -32,6 +32,10 @@ _PROCESS_ID = uuid.uuid4().hex
 
 # --- executions ledger --------------------------------------------------------------------------
 
+def _db_path() -> Path:
+    return EXECUTIONS_FILE or (get_hermes_home() / "cron" / "executions.db")
+
+
 def _connect() -> sqlite3.Connection:
     # Late imports: a scheduler daemon that outlives an on-disk upgrade already has the OLD
     # ``hermes_cli.sqlite_util`` / ``cron.jobs`` cached, so new names must be resolved at call time,
@@ -39,9 +43,19 @@ def _connect() -> sqlite3.Connection:
     from cron.jobs import _ensure_cron_dir
     from hermes_cli.sqlite_util import open_db
 
-    path = EXECUTIONS_FILE or (get_hermes_home().resolve() / "cron" / "executions.db")
+    from cron import execution_archive
+
+    path = _db_path()
+    if execution_archive.requested(path):
+        execution_archive.secure_ledger(path)
     _ensure_cron_dir(path.parent)
-    return open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
+    conn = open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
+    try:
+        execution_archive.initialize(conn, path)
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -90,10 +104,39 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def _transaction() -> Iterator[sqlite3.Connection]:
-    from hermes_cli.sqlite_util import transaction
+    from cron import execution_archive
 
-    with _lock, transaction(_connect()) as conn:
-        yield conn
+    with _lock:
+        conn = _connect()
+        try:
+            with conn:
+                yield conn
+            execution_archive.preserve(conn, _db_path())
+        finally:
+            conn.close()
+
+
+def _dispatch_guard(conn: sqlite3.Connection, execution_id: Optional[str] = None) -> None:
+    from cron import execution_archive
+
+    execution_archive.preserve(conn, _db_path(), verify_all=True)
+    if execution_id is not None and execution_archive.active(conn):
+        if conn.execute("SELECT 1 FROM execution_archive_jobs WHERE id=?", (execution_id,)).fetchone() is None:
+            raise execution_archive.ArchiveUnavailable("Cron dispatch has no immutable job original")
+
+
+def bind_execution_job(execution_id: str, job: dict) -> None:
+    """Bind the exact store-claimed dispatch definition before owner side effects."""
+    from cron import execution_archive
+
+    with _transaction() as conn:
+        if not execution_archive.active(conn):
+            return
+        _dispatch_guard(conn)
+        row = _fetch(conn, execution_id)
+        if row is None or row["job_id"] != str(job["id"]):
+            raise execution_archive.ArchiveUnavailable("Cron job original does not match its live attempt")
+        execution_archive.bind_job(conn, execution_id, job)
 
 
 def _fetch(conn: sqlite3.Connection, execution_id: str) -> Optional[Dict[str, Any]]:
@@ -135,6 +178,10 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
+    from cron import execution_archive
+
+    if execution_archive.active(conn):
+        return  # commit and archive terminal state before pruning in a second transaction
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
@@ -143,6 +190,28 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
            )""",
         (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
     )
+
+
+def _prune_archived() -> None:
+    from cron import execution_archive
+
+    with _lock:
+        conn = _connect()
+        try:
+            if not execution_archive.active(conn):
+                return
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                execution_archive.sync(conn, _db_path(), verify_all=True)
+                rows = conn.execute("SELECT * FROM executions WHERE status IN "
+                                    "('completed','failed','unknown') ORDER BY finished_at DESC, "
+                                    "claimed_at DESC, id DESC LIMIT -1 OFFSET ?",
+                                    (max(0, int(MAX_TERMINAL_EXECUTIONS)),)).fetchall()
+                for row in rows:
+                    execution_archive.verify_prune(conn, dict(row))
+                    conn.execute("DELETE FROM executions WHERE id=?", (row["id"],))
+        finally:
+            conn.close()
 
 
 def create_execution(
@@ -155,6 +224,7 @@ def create_execution(
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
     with _transaction() as conn:
+        _dispatch_guard(conn)
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
@@ -185,6 +255,7 @@ def set_execution_occurrence(execution_id: str, instant: Optional[str]) -> None:
 def mark_execution_handoff_pending(execution_id: str) -> Optional[Dict[str, Any]]:
     """Fence restart recovery while an external worker is adopting a claim."""
     with _transaction() as conn:
+        _dispatch_guard(conn, execution_id)
         cur = conn.execute(
             """UPDATE executions
                SET handoff_pending=1, handoff_started_at=?
@@ -210,6 +281,7 @@ def adopt_claimed_execution(execution_id: str) -> Optional[Dict[str, Any]]:
     process_started_at = _process_start_time(pid)
     now = _hermes_now().isoformat()
     with _transaction() as conn:
+        _dispatch_guard(conn, execution_id)
         cur = conn.execute(
             """UPDATE executions
                SET process_id=?, pid=?, process_started_at=?,
@@ -229,6 +301,7 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
     """Transition one claimed attempt to running exactly once."""
     now = _hermes_now().isoformat()
     with _transaction() as conn:
+        _dispatch_guard(conn, execution_id)
         cur = conn.execute(
             """UPDATE executions
                SET status='running', started_at=?, handoff_pending=0,
@@ -249,10 +322,13 @@ def finish_execution(
     delivery_outcome: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten."""
+    from cron import execution_archive
+
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
     with _transaction() as conn:
+        archive_enabled = execution_archive.active(conn)
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
@@ -266,15 +342,20 @@ def finish_execution(
         _prune_unlocked(conn)
         record = _fetch(conn, execution_id)
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
+    if archive_enabled:
+        _prune_archived()
     return record
 
 
 def recover_interrupted_executions() -> int:
     """Mark provably abandoned attempts unknown without scheduling retries."""
+    from cron import execution_archive
+
     now = _hermes_now().isoformat()
     changed = 0
     recovered: List[Dict[str, Any]] = []
     with _transaction() as conn:
+        archive_enabled = execution_archive.active(conn)
         rows = conn.execute(
             """SELECT id, status, process_id, pid, process_started_at,
                       handoff_pending, handoff_started_at
@@ -316,6 +397,8 @@ def recover_interrupted_executions() -> int:
             _prune_unlocked(conn)
     for record in recovered:
         _emit_execution_state(record)
+    if changed and archive_enabled:
+        _prune_archived()
     return changed
 
 

@@ -455,8 +455,8 @@ def test_ledger_operations_close_every_connection(monkeypatch, tmp_path):
     executions.latest_executions(["leak-check"])
     executions.recover_interrupted_executions()
 
-    assert len(opened) == 6
-    assert len(closed) == 6
+    assert len(opened) >= 6  # archive opt-in probes may open additional read-only connections
+    assert len(closed) == len(opened)
     assert set(opened) == set(closed)
 
 
@@ -468,8 +468,8 @@ def test_early_return_still_closes_connection(monkeypatch, tmp_path):
 
     assert executions.mark_execution_running("does-not-exist") is None
 
-    assert len(opened) == 1
-    assert len(closed) == 1
+    assert opened
+    assert len(closed) == len(opened)
 
 
 def test_exception_during_operation_still_closes_connection(monkeypatch, tmp_path):
@@ -485,8 +485,8 @@ def test_exception_during_operation_still_closes_connection(monkeypatch, tmp_pat
                 "status, claimed_at) VALUES ('x', 'x', 'x', 'x', 1, 'bogus-status', 'now')"
             )
 
-    assert len(opened) == 1
-    assert len(closed) == 1
+    assert opened
+    assert len(closed) == len(opened)
 
 
 def test_schema_init_failure_still_closes_connection(monkeypatch, tmp_path):

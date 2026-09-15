@@ -2487,6 +2487,9 @@ def run_one_job(
         job["execution_id"] = execution["id"]
 
     execution_id = str(job["execution_id"])
+    from cron.executions import bind_execution_job
+
+    bind_execution_job(execution_id, job)
     external_owner = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER") == execution_id
     if not external_owner:
         try:
@@ -2863,6 +2866,9 @@ def _run_one_job_body(
     if not execution_id:
         execution_id = create_execution(
             job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))["id"]
+    from cron.executions import bind_execution_job
+
+    bind_execution_job(str(execution_id), job)
     delivery_attempted = False
     delivery_error = None
     from agent.secret_scope import (

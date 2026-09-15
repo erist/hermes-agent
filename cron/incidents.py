@@ -50,7 +50,7 @@ def _db_path() -> Path:
     for override in (_executions.EXECUTIONS_FILE, EXECUTIONS_FILE):
         if override is not None:
             return Path(override)
-    return get_hermes_home().resolve() / "cron" / "executions.db"
+    return get_hermes_home() / "cron" / "executions.db"
 
 
 def _connect() -> sqlite3.Connection:
@@ -60,9 +60,19 @@ def _connect() -> sqlite3.Connection:
     from cron.jobs import _ensure_cron_dir
     from hermes_cli.sqlite_util import open_db
 
+    from cron import execution_archive
+
     path = _db_path()
+    if execution_archive.requested(path):
+        execution_archive.secure_ledger(path)
     _ensure_cron_dir(path.parent)
-    return open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
+    conn = open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
+    try:
+        execution_archive.initialize(conn, path)
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -93,10 +103,16 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def _transaction() -> Iterator[sqlite3.Connection]:
-    from hermes_cli.sqlite_util import transaction
+    from cron import execution_archive
 
-    with _lock, transaction(_connect()) as conn:
-        yield conn
+    with _lock:
+        conn = _connect()
+        try:
+            with conn:
+                yield conn
+            execution_archive.preserve(conn, _db_path())
+        finally:
+            conn.close()
 
 
 def _normalize_error(error: str) -> str:
