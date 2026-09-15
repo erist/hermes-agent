@@ -46,12 +46,16 @@ def _connect() -> sqlite3.Connection:
     from cron import execution_archive
 
     path = _db_path()
-    if execution_archive.requested(path):
+    archive_requested = execution_archive.requested(path)
+    if archive_requested:
         execution_archive.secure_ledger(path)
     _ensure_cron_dir(path.parent)
-    conn = open_db(path, db_label="cron/executions.db", synchronous_full=True, initialize=_initialize_schema)
+    conn = open_db(path, db_label="cron/executions.db", synchronous_full=True)
     try:
-        execution_archive.initialize(conn, path)
+        if archive_requested or execution_archive.active(conn):
+            execution_archive.initialize(conn, path)
+        else:
+            _initialize_schema(conn)
         return conn
     except BaseException:
         conn.close()
@@ -109,6 +113,7 @@ def _transaction() -> Iterator[sqlite3.Connection]:
     with _lock:
         conn = _connect()
         try:
+            execution_archive.begin_guarded_transaction(conn)
             with conn:
                 yield conn
             execution_archive.preserve(conn, _db_path())
@@ -119,8 +124,15 @@ def _transaction() -> Iterator[sqlite3.Connection]:
 def _dispatch_guard(conn: sqlite3.Connection, execution_id: Optional[str] = None) -> None:
     from cron import execution_archive
 
-    execution_archive.preserve(conn, _db_path(), verify_all=True)
-    if execution_id is not None and execution_archive.active(conn):
+    if not execution_archive.active(conn):
+        return
+    # Prove receipt commit before creating/starting an attempt. Reacquire the
+    # schema fence through the transition so another writer cannot remove capture.
+    execution_archive.sync(conn, _db_path(), verify_all=True)
+    conn.commit()
+    execution_archive.begin_guarded_transaction(conn)
+    execution_archive.sync(conn, _db_path(), verify_all=True)
+    if execution_id is not None:
         if conn.execute("SELECT 1 FROM execution_archive_jobs WHERE id=?", (execution_id,)).fetchone() is None:
             raise execution_archive.ArchiveUnavailable("Cron dispatch has no immutable job original")
 

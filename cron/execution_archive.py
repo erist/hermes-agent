@@ -18,6 +18,14 @@ from contextlib import contextmanager
 from pathlib import Path
 
 _TABLES = ("executions", "cron_incidents", "execution_archive_jobs")
+_CONTROL_TABLES = {
+    "execution_archive_meta": "(id INTEGER PRIMARY KEY CHECK(id=1), stream_id TEXT NOT NULL)",
+    "execution_archive_jobs": "(id TEXT PRIMARY KEY, job_id TEXT NOT NULL, snapshot TEXT NOT NULL)",
+    "execution_archive_events": "(event_id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT NOT NULL, "
+                                "record_id TEXT NOT NULL, snapshot TEXT NOT NULL)",
+    "execution_archive_receipts": "(event_id INTEGER PRIMARY KEY, digest TEXT NOT NULL, row_digest TEXT NOT NULL)",
+    "execution_archive_schemas": "(table_name TEXT PRIMARY KEY, schema_json TEXT NOT NULL)",
+}
 
 
 class ArchiveUnavailable(RuntimeError):
@@ -122,64 +130,125 @@ def initialize(conn: sqlite3.Connection, path: Path) -> None:
         return
     secure_ledger(path)
     conn.execute("BEGIN IMMEDIATE")
-    conn.execute("CREATE TABLE IF NOT EXISTS execution_archive_meta "
-                 "(id INTEGER PRIMARY KEY CHECK(id=1), stream_id TEXT NOT NULL)")
-    if conn.execute("SELECT 1 FROM execution_archive_meta WHERE id=1").fetchone() is None:
-        conn.execute("INSERT INTO execution_archive_meta VALUES (1, ?)", (uuid.uuid4().hex,))
-    conn.execute("CREATE TABLE IF NOT EXISTS execution_archive_jobs "
-                 "(id TEXT PRIMARY KEY, job_id TEXT NOT NULL, snapshot TEXT NOT NULL)")
-    conn.execute("CREATE TABLE IF NOT EXISTS execution_archive_events "
-                 "(event_id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT NOT NULL, "
-                 "record_id TEXT NOT NULL, snapshot TEXT NOT NULL)")
-    conn.execute("CREATE TABLE IF NOT EXISTS execution_archive_receipts "
-                 "(event_id INTEGER PRIMARY KEY, digest TEXT NOT NULL, row_digest TEXT NOT NULL)")
-    conn.execute("CREATE INDEX IF NOT EXISTS execution_archive_record "
-                 "ON execution_archive_events(table_name, record_id, event_id)")
-    conn.execute("CREATE TABLE IF NOT EXISTS execution_archive_schemas "
-                 "(table_name TEXT PRIMARY KEY, schema_json TEXT NOT NULL)")
-    for table in ("execution_archive_meta", "execution_archive_events",
-                  "execution_archive_receipts", "execution_archive_jobs"):
-        key = "event_id" if table in ("execution_archive_events", "execution_archive_receipts") else "id"
-        conn.execute(f"CREATE TRIGGER IF NOT EXISTS {table}_immutable_INSERT BEFORE INSERT ON {table} "
-                     f"WHEN EXISTS (SELECT 1 FROM {table} WHERE {key}=NEW.{key}) BEGIN "
-                     "SELECT RAISE(ABORT, 'Cron archive originals are immutable'); END")
-        for action in ("UPDATE", "DELETE"):
-            conn.execute(f"CREATE TRIGGER IF NOT EXISTS {table}_immutable_{action} "
-                         f"BEFORE {action} ON {table} BEGIN "
-                         "SELECT RAISE(ABORT, 'Cron archive originals are immutable'); END")
+    if active(conn):
+        verify_schema(conn)
+        _verify_current_rows(conn)
+        conn.commit()
+        return
+    # Existing archive artifacts without the stream root are corruption, never a
+    # request to reinitialize or synthesize a new history over the current rows.
+    if (conn.execute("SELECT 1 FROM sqlite_master WHERE name LIKE 'execution_archive_%'").fetchone()
+            or (path.parent / "execution-archive").exists()):
+        raise ArchiveUnavailable("Cron archive schema is incomplete")
+    from cron import executions, incidents
+
+    executions._initialize_schema(conn)
+    incidents._initialize_schema(conn)
+    for sql in _control_sql().values():
+        conn.execute(sql)
+    conn.execute("INSERT INTO execution_archive_meta VALUES (1, ?)", (uuid.uuid4().hex,))
     for table in _TABLES:
-        _install_capture(conn, table)
+        schema = _source_schema(conn, table)
+        conn.execute("INSERT INTO execution_archive_schemas VALUES (?, ?)", (table, schema))
+        for sql in _capture_sql(table, schema).values():
+            conn.execute(sql)
+        for row in conn.execute(f"SELECT * FROM {table}"):
+            value = {"format": 1, "table": table, "schema": json.loads(schema), "row": dict(row)}
+            conn.execute("INSERT INTO execution_archive_events(table_name, record_id, snapshot) "
+                         "VALUES (?, ?, ?)", (table, row["id"], _canonical(value).decode()))
+    verify_schema(conn)
     conn.commit()
 
 
-def _install_capture(conn: sqlite3.Connection, table: str) -> None:
+def _control_sql() -> dict[str, str]:
+    definitions = {table: f"CREATE TABLE {table} {columns}" for table, columns in _CONTROL_TABLES.items()}
+    definitions["execution_archive_record"] = ("CREATE INDEX execution_archive_record "
+                                                "ON execution_archive_events(table_name, record_id, event_id)")
+    for table in _CONTROL_TABLES:
+        key = "event_id" if table in ("execution_archive_events", "execution_archive_receipts") else "id"
+        if table == "execution_archive_schemas":
+            key = "table_name"
+        name = f"{table}_immutable_INSERT"
+        definitions[name] = (f"CREATE TRIGGER {name} BEFORE INSERT ON {table} "
+                             f"WHEN EXISTS (SELECT 1 FROM {table} WHERE {key}=NEW.{key}) BEGIN "
+                             "SELECT RAISE(ABORT, 'Cron archive originals are immutable'); END")
+        for action in ("UPDATE", "DELETE"):
+            name = f"{table}_immutable_{action}"
+            definitions[name] = (f"CREATE TRIGGER {name} BEFORE {action} ON {table} BEGIN "
+                                 "SELECT RAISE(ABORT, 'Cron archive originals are immutable'); END")
+    return definitions
+
+
+def _source_schema(conn: sqlite3.Connection, table: str) -> str:
     definition = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
                               (table,)).fetchone()
     if definition is None:
-        return
+        raise ArchiveUnavailable("Cron archive source table is missing")
     columns = [tuple(row) for row in conn.execute(f"PRAGMA table_info({table})")]
-    schema = _canonical({"sql": definition[0], "columns": columns,
-                         "user_version": conn.execute("PRAGMA user_version").fetchone()[0]}).decode()
-    existing = conn.execute("SELECT schema_json FROM execution_archive_schemas WHERE table_name=?",
-                            (table,)).fetchone()
-    if existing is not None and existing[0] == schema:
-        return
+    indexes = [tuple(row) for row in conn.execute("SELECT name, sql FROM sqlite_master "
+                                                  "WHERE type='index' AND tbl_name=? ORDER BY name", (table,))]
+    return _canonical({"sql": definition[0], "columns": columns, "indexes": indexes,
+                       "user_version": conn.execute("PRAGMA user_version").fetchone()[0]}).decode()
+
+
+def _capture_sql(table: str, schema: str) -> dict[str, str]:
+    columns = json.loads(schema)["columns"]
     fields = ", ".join(f"{_literal(col[1])}, NEW.\"{col[1]}\"" for col in columns)
     snapshot = (f"json_object('format', 1, 'table', '{table}', 'schema', json({_literal(schema)}), "
                 f"'row', json_object({fields}))")
+    definitions = {}
     for action in ("INSERT", "UPDATE"):
         name = f"execution_archive_capture_{table}_{action}"
-        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
-        conn.execute(f"CREATE TRIGGER {name} AFTER {action} ON {table} BEGIN "
-                     "INSERT INTO execution_archive_events(table_name, record_id, snapshot) "
-                     f"VALUES ('{table}', NEW.id, {snapshot}); END")
-    # Existing originals are observed exactly as stored; absent historical job definitions
-    # are not reconstructed from today's jobs.json.
-    for row in conn.execute(f"SELECT * FROM {table}"):
-        value = {"format": 1, "table": table, "schema": json.loads(schema), "row": dict(row)}
-        conn.execute("INSERT INTO execution_archive_events(table_name, record_id, snapshot) "
-                     "VALUES (?, ?, ?)", (table, row["id"], _canonical(value).decode()))
-    conn.execute("INSERT OR REPLACE INTO execution_archive_schemas VALUES (?, ?)", (table, schema))
+        definitions[name] = (f"CREATE TRIGGER {name} AFTER {action} ON {table} BEGIN "
+                             "INSERT INTO execution_archive_events(table_name, record_id, snapshot) "
+                             f"VALUES ('{table}', NEW.id, {snapshot}); END")
+    return definitions
+
+
+def verify_schema(conn: sqlite3.Connection) -> None:
+    """Validate capture and immutability, never silently repair a damaged archive."""
+    actual = {row["name"]: row["sql"] for row in conn.execute("SELECT name, sql FROM sqlite_master")}
+    expected = _control_sql()
+    for name, sql in expected.items():
+        if actual.get(name) != sql:
+            raise ArchiveUnavailable("Cron archive control schema is missing or changed")
+    manifest = {row["table_name"]: row["schema_json"] for row in conn.execute("SELECT * FROM execution_archive_schemas")}
+    if set(manifest) != set(_TABLES):
+        raise ArchiveUnavailable("Cron archive schema manifest is incomplete")
+    for table, schema in manifest.items():
+        if _source_schema(conn, table) != schema:
+            raise ArchiveUnavailable("Cron archive source schema has changed")
+        expected.update(_capture_sql(table, schema))
+    for name, sql in expected.items():
+        if actual.get(name) != sql:
+            raise ArchiveUnavailable("Cron archive capture schema is missing or changed")
+    if {name for name in actual if name.startswith("execution_archive_")} != set(expected):
+        raise ArchiveUnavailable("Cron archive schema has unexpected objects")
+    # Unknown triggers could suppress writes before the canonical capture trigger runs.
+    protected = set(_TABLES) | set(_CONTROL_TABLES)
+    for row in conn.execute("SELECT name, tbl_name FROM sqlite_master WHERE type='trigger'"):
+        if row["tbl_name"] in protected and row["name"] not in expected:
+            raise ArchiveUnavailable("Cron archive schema contains an unrecognized trigger")
+    streams = conn.execute("SELECT * FROM execution_archive_meta").fetchall()
+    if len(streams) != 1 or streams[0]["id"] != 1 or not re.fullmatch(r"[0-9a-f]{32}", streams[0]["stream_id"]):
+        raise ArchiveUnavailable("Cron archive stream identity is invalid")
+
+
+def _verify_current_rows(conn: sqlite3.Connection) -> None:
+    for table in _TABLES:
+        for row in conn.execute(f"SELECT * FROM {table}"):
+            latest = conn.execute("SELECT snapshot FROM execution_archive_events "
+                                  "WHERE table_name=? AND record_id=? ORDER BY event_id DESC LIMIT 1",
+                                  (table, row["id"])).fetchone()
+            if latest is None or json.loads(latest[0])["row"] != dict(row):
+                raise ArchiveUnavailable("Cron archive is missing an exact current row version")
+
+
+def begin_guarded_transaction(conn: sqlite3.Connection) -> None:
+    if active(conn):
+        conn.execute("BEGIN IMMEDIATE")
+        verify_schema(conn)
+        _verify_current_rows(conn)
 
 
 @contextmanager
@@ -287,6 +356,8 @@ def sync(conn: sqlite3.Connection, path: Path, *, verify_all: bool = False) -> N
     """Flush only committed journal versions. Caller holds the SQLite write fence."""
     if not active(conn):
         return
+    verify_schema(conn)
+    _verify_current_rows(conn)
     stream_id = conn.execute("SELECT stream_id FROM execution_archive_meta WHERE id=1").fetchone()[0]
     with _directory(path) as directory:
         # A FULL SQLite commit is the first durable original; archive publishes are second.
@@ -357,6 +428,7 @@ def lookup(path: Path, *, table: str, record_id: str) -> list[dict]:
     conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
+        verify_schema(conn)
         stream = conn.execute("SELECT stream_id FROM execution_archive_meta WHERE id=1").fetchone()[0]
         rows = conn.execute("SELECT e.*, r.digest FROM execution_archive_events e JOIN "
                             "execution_archive_receipts r ON r.event_id=e.event_id "

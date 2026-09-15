@@ -21,6 +21,14 @@ owner process identity, status, timestamps, and errors. Before dispatch, the rea
 store-claimed job definition is bound as another immutable original, including its
 registration fields, script, workdir, schedule, and fire claim.
 
+Before an archived ledger is opened for operations, canonical table, index, capture
+trigger, and immutability trigger definitions are verified alongside the immutable
+source-schema manifest and current row coverage. Missing or altered objects fail
+closed without being recreated. The SQLite write fence remains held through state
+changes so a concurrent writer cannot remove capture between validation and write.
+Source schema upgrades require an explicitly reviewed archive migration; normal
+startup does not rewrite the manifest or accept changed source tables.
+
 Committed versions are published as private, content-addressed JSON files in
 `cron/execution-archive/`. Each receipt includes its stream and event IDs, previous
 event ID, exact row digest, and original schema and row. Publication uses a private

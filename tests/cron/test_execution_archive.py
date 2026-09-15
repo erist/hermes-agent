@@ -330,3 +330,79 @@ except (a.ArchiveUnavailable, __import__('sqlite3').OperationalError):
     assert len({row["id"] for row in rows}) == len(rows)
     for row in rows:
         assert archive.lookup(path, table="executions", record_id=row["id"])[-1]["original"]["row"] == row
+
+
+@pytest.mark.parametrize("fault", ["drop-capture", "alter-capture", "alter-immutable", "drop-index",
+                                   "drop-table", "change-source", "missing-manifest", "unknown-trigger"])
+def test_schema_damage_blocks_open_dispatch_and_prune_without_repair(ledger, monkeypatch, fault):
+    _, path = ledger
+    row, _ = _claim()
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 0)
+    with closing(sqlite3.connect(path)) as conn:
+        if fault in ("drop-capture", "alter-capture"):
+            name = "execution_archive_capture_executions_UPDATE"
+            conn.execute(f"DROP TRIGGER {name}")
+            if fault == "alter-capture":
+                conn.execute(f"CREATE TRIGGER {name} AFTER UPDATE ON executions BEGIN SELECT 1; END")
+        elif fault == "alter-immutable":
+            name = "execution_archive_receipts_immutable_UPDATE"
+            conn.execute(f"DROP TRIGGER {name}")
+            conn.execute(f"CREATE TRIGGER {name} BEFORE UPDATE ON execution_archive_receipts BEGIN SELECT 1; END")
+        elif fault == "drop-index":
+            conn.execute("DROP INDEX execution_archive_record")
+        elif fault == "drop-table":
+            conn.execute("DROP TABLE execution_archive_jobs")
+        elif fault == "change-source":
+            conn.execute("ALTER TABLE executions ADD COLUMN changed_source TEXT")
+        elif fault == "missing-manifest":
+            name = "execution_archive_schemas_immutable_DELETE"
+            definition = conn.execute("SELECT sql FROM sqlite_master WHERE name=?", (name,)).fetchone()[0]
+            conn.execute(f"DROP TRIGGER {name}")
+            conn.execute("DELETE FROM execution_archive_schemas WHERE table_name='executions'")
+            conn.execute(definition)
+        else:
+            conn.execute("CREATE TRIGGER bypass_capture BEFORE UPDATE ON executions BEGIN SELECT RAISE(IGNORE); END")
+        conn.commit()
+        objects = conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall()
+    originals = _rows(path)
+    for operation in (lambda: executions.mark_execution_running(row["id"]),
+                      lambda: executions.create_execution("blocked", source="mock-owner"),
+                      lambda: executions.finish_execution(row["id"], success=True),
+                      executions._prune_archived):
+        with pytest.raises(archive.ArchiveUnavailable):
+            operation()
+        assert _rows(path) == originals
+    with closing(sqlite3.connect(path)) as conn:
+        assert conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall() == objects
+
+
+def test_restored_capture_cannot_hide_an_unjournaled_current_version(ledger):
+    _, path = ledger
+    row, _ = _claim()
+    with closing(sqlite3.connect(path)) as conn:
+        name = "execution_archive_capture_executions_UPDATE"
+        definition = conn.execute("SELECT sql FROM sqlite_master WHERE name=?", (name,)).fetchone()[0]
+        conn.execute(f"DROP TRIGGER {name}")
+        conn.execute("UPDATE executions SET status='running' WHERE id=?", (row["id"],))
+        conn.execute(definition)
+        conn.commit()
+    originals = _rows(path)
+    with pytest.raises(archive.ArchiveUnavailable, match="exact current row"):
+        executions.finish_execution(row["id"], success=True)
+    with pytest.raises(archive.ArchiveUnavailable, match="exact current row"):
+        executions.create_execution("blocked", source="mock-owner")
+    assert _rows(path) == originals
+
+
+def test_schema_manifest_rejects_update_delete_and_replace(ledger):
+    _, path = ledger
+    _claim()
+    with closing(sqlite3.connect(path)) as conn:
+        originals = conn.execute("SELECT * FROM execution_archive_schemas ORDER BY table_name").fetchall()
+        for statement in ("UPDATE execution_archive_schemas SET schema_json='{}'",
+                          "DELETE FROM execution_archive_schemas",
+                          "INSERT OR REPLACE INTO execution_archive_schemas SELECT * FROM execution_archive_schemas"):
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                conn.execute(statement)
+            conn.rollback()
+        assert conn.execute("SELECT * FROM execution_archive_schemas ORDER BY table_name").fetchall() == originals
