@@ -232,6 +232,25 @@ def verify_schema(conn: sqlite3.Connection) -> None:
     streams = conn.execute("SELECT * FROM execution_archive_meta").fetchall()
     if len(streams) != 1 or streams[0]["id"] != 1 or not re.fullmatch(r"[0-9a-f]{32}", streams[0]["stream_id"]):
         raise ArchiveUnavailable("Cron archive stream identity is invalid")
+    _verify_journal(conn)
+
+
+def _verify_journal(conn: sqlite3.Connection, *, require_receipts: bool = False) -> None:
+    """Retained stream identity covers versions whose hot execution was already pruned."""
+    count, first, last = conn.execute("SELECT COUNT(*), MIN(event_id), MAX(event_id) "
+                                     "FROM execution_archive_events").fetchone()
+    sequence = conn.execute("SELECT seq FROM sqlite_sequence WHERE name='execution_archive_events'").fetchall()
+    high_water = sequence[0][0] if len(sequence) == 1 else 0
+    if (len(sequence) > 1 or type(high_water) is not int or high_water != count
+            or (count and (first != 1 or last != count))):
+        raise ArchiveUnavailable("Cron archive journal stream is incomplete")
+    if conn.execute("SELECT 1 FROM execution_archive_receipts r LEFT JOIN execution_archive_events e "
+                    "ON e.event_id=r.event_id WHERE e.event_id IS NULL LIMIT 1").fetchone():
+        raise ArchiveUnavailable("Cron archive receipt has no original event")
+    if require_receipts and conn.execute(
+            "SELECT 1 FROM execution_archive_events e LEFT JOIN execution_archive_receipts r "
+            "ON r.event_id=e.event_id WHERE r.event_id IS NULL LIMIT 1").fetchone():
+        raise ArchiveUnavailable("Cron archive lineage is missing a durable receipt")
 
 
 def _verify_current_rows(conn: sqlite3.Connection) -> None:
@@ -352,6 +371,16 @@ def _document(stream_id: str, event) -> tuple[bytes, str]:
     return _canonical(value), row_digest
 
 
+def _verify_original_files(conn: sqlite3.Connection, directory: int, *, complete: bool) -> None:
+    """A rolled-back DB cannot silently forget newer immutable originals on disk."""
+    stream_id = conn.execute("SELECT stream_id FROM execution_archive_meta WHERE id=1").fetchone()[0]
+    expected = {_digest(_document(stream_id, event)[0]) + ".json"
+                for event in conn.execute("SELECT * FROM execution_archive_events ORDER BY event_id")}
+    originals = {name for name in os.listdir(directory) if name.endswith(".json")}
+    if originals - expected or (complete and originals != expected):
+        raise ArchiveUnavailable("Cron archive original file set does not match the journal")
+
+
 def sync(conn: sqlite3.Connection, path: Path, *, verify_all: bool = False) -> None:
     """Flush only committed journal versions. Caller holds the SQLite write fence."""
     if not active(conn):
@@ -360,6 +389,7 @@ def sync(conn: sqlite3.Connection, path: Path, *, verify_all: bool = False) -> N
     _verify_current_rows(conn)
     stream_id = conn.execute("SELECT stream_id FROM execution_archive_meta WHERE id=1").fetchone()[0]
     with _directory(path) as directory:
+        _verify_original_files(conn, directory, complete=False)
         # A FULL SQLite commit is the first durable original; archive publishes are second.
         query = ("SELECT e.*, r.digest AS receipt_digest, r.row_digest AS receipt_row "
                                   "FROM execution_archive_events e LEFT JOIN execution_archive_receipts r "
@@ -378,6 +408,8 @@ def sync(conn: sqlite3.Connection, path: Path, *, verify_all: bool = False) -> N
                 _publish(directory, name, data)
                 conn.execute("INSERT INTO execution_archive_receipts VALUES (?, ?, ?)",
                              (event["event_id"], digest, row_digest))
+        _verify_journal(conn, require_receipts=True)
+        _verify_original_files(conn, directory, complete=True)
 
 
 def preserve(conn: sqlite3.Connection, path: Path, *, verify_all: bool = False) -> None:
@@ -431,6 +463,7 @@ def lookup(path: Path, *, table: str, record_id: str) -> list[dict]:
         conn.execute("BEGIN")
         verify_schema(conn)
         _verify_current_rows(conn)
+        _verify_journal(conn, require_receipts=True)
         stream = conn.execute("SELECT stream_id FROM execution_archive_meta WHERE id=1").fetchone()[0]
         rows = conn.execute("SELECT e.*, r.digest FROM execution_archive_events e LEFT JOIN "
                             "execution_archive_receipts r ON r.event_id=e.event_id "
@@ -440,6 +473,7 @@ def lookup(path: Path, *, table: str, record_id: str) -> list[dict]:
             raise ArchiveUnavailable("Cron historical lineage is missing a durable receipt")
         result = []
         with _directory(path) as directory:
+            _verify_original_files(conn, directory, complete=True)
             for event in rows:
                 data, _ = _document(stream, event)
                 if _digest(data) != event["digest"] or _read(directory, event["digest"] + ".json") != data:

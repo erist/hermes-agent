@@ -432,3 +432,94 @@ def test_historical_lookup_rejects_incomplete_lineage(ledger, fault):
     assert _rows(path) == originals
     assert _rows(path, "execution_archive_events") == events
     assert _rows(path, "execution_archive_receipts") == receipts
+
+
+@pytest.mark.parametrize("missing", ["entire-pruned-lineage", "trailing-pruned-version"])
+def test_pruned_only_journal_corruption_blocks_lookup_and_dispatch(ledger, monkeypatch, missing):
+    _, path = ledger
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 0)
+    row, _ = _claim()
+    executions.finish_execution(row["id"], success=True)
+    assert executions.get_execution(row["id"]) is None
+    assert archive.lookup(path, table="executions", record_id=row["id"])
+    with closing(sqlite3.connect(path)) as conn:
+        name = "execution_archive_events_immutable_DELETE"
+        definition = conn.execute("SELECT sql FROM sqlite_master WHERE name=?", (name,)).fetchone()[0]
+        conn.execute(f"DROP TRIGGER {name}")
+        if missing == "entire-pruned-lineage":
+            conn.execute("DELETE FROM execution_archive_events WHERE table_name='executions' AND record_id=?",
+                         (row["id"],))
+        else:
+            conn.execute("DELETE FROM execution_archive_events WHERE event_id="
+                         "(SELECT MAX(event_id) FROM execution_archive_events)")
+        conn.execute(definition)
+        conn.commit()
+    remaining = _rows(path, "execution_archive_events")
+    receipts = _rows(path, "execution_archive_receipts")
+    for operation in (lambda: archive.lookup(path, table="executions", record_id=row["id"]),
+                      lambda: executions.create_execution("blocked", source="mock-owner")):
+        with pytest.raises(archive.ArchiveUnavailable, match="journal stream is incomplete"):
+            operation()
+    assert _rows(path) == []
+    assert _rows(path, "execution_archive_events") == remaining
+    assert _rows(path, "execution_archive_receipts") == receipts
+
+
+def test_orphan_receipt_is_rejected_even_with_contiguous_events(ledger):
+    _, path = ledger
+    row, _ = _claim()
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("INSERT INTO execution_archive_receipts "
+                     "SELECT 999999, digest, row_digest FROM execution_archive_receipts LIMIT 1")
+        conn.commit()
+    with pytest.raises(archive.ArchiveUnavailable, match="no original event"):
+        archive.lookup(path, table="executions", record_id=row["id"])
+    with pytest.raises(archive.ArchiveUnavailable, match="no original event"):
+        executions.create_execution("blocked", source="mock-owner")
+    assert len(_rows(path)) == 1
+
+
+def test_pending_committed_event_recovers_by_durable_sync_without_reconstruction(ledger):
+    _, path = ledger
+    row, _ = _claim()
+    receipts = _rows(path, "execution_archive_receipts")
+    with closing(sqlite3.connect(path)) as conn:
+        conn.execute("UPDATE executions SET status='running' WHERE id=?", (row["id"],))
+        conn.commit()
+    originals = _rows(path)
+    events = _rows(path, "execution_archive_events")
+    assert len(events) == len(receipts) + 1
+    with pytest.raises(archive.ArchiveUnavailable, match="missing a durable receipt"):
+        archive.lookup(path, table="executions", record_id=row["id"])
+    result = archive.initialize_existing()
+    assert result["counts"]["execution_archive_events"] == result["counts"]["execution_archive_receipts"]
+    assert _rows(path) == originals
+    assert _rows(path, "execution_archive_events") == events
+    assert _rows(path, "execution_archive_receipts")[:len(receipts)] == receipts
+    history = archive.lookup(path, table="executions", record_id=row["id"])
+    assert [entry["original"]["row"]["status"] for entry in history] == ["claimed", "running"]
+
+
+def test_database_rollback_cannot_forget_newer_original_files(ledger):
+    _, path = ledger
+    first, _ = _claim("first")
+    snapshot = path.with_name("prior-snapshot.db")
+    with closing(sqlite3.connect(path)) as current, closing(sqlite3.connect(snapshot)) as saved:
+        current.backup(saved)
+    _claim("newer")
+    files = {file.name: file.read_bytes() for file in (path.parent / "execution-archive").glob("*.json")}
+    with closing(sqlite3.connect(snapshot)) as saved, closing(sqlite3.connect(path)) as current:
+        saved.backup(current)
+    originals = _rows(path)
+    events = _rows(path, "execution_archive_events")
+    receipts = _rows(path, "execution_archive_receipts")
+    assert len(originals) == 1 and len(events) == len(receipts)
+    for operation in (lambda: archive.lookup(path, table="executions", record_id=first["id"]),
+                      lambda: executions.create_execution("blocked", source="mock-owner"),
+                      executions._prune_archived):
+        with pytest.raises(archive.ArchiveUnavailable, match="original file set"):
+            operation()
+    assert _rows(path) == originals
+    assert _rows(path, "execution_archive_events") == events
+    assert _rows(path, "execution_archive_receipts") == receipts
+    assert {file.name: file.read_bytes() for file in (path.parent / "execution-archive").glob("*.json")} == files
